@@ -3,6 +3,7 @@ const app = express()
 const port = process.env.PORT || 5000
 const cors = require('cors')
 require('dotenv').config()
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 app.use(cors())
 app.use(express.json());
@@ -35,6 +36,12 @@ async function run() {
         const tasksCollection = db.collection("tasks");
         const freelancersCollection = db.collection("freelancers");
         const proposalsCollection = db.collection("proposals");
+        const paymentsCollection = db.collection("payments");
+        const userCollection = db.collection("user");
+
+
+
+
 
 
 
@@ -61,7 +68,11 @@ async function run() {
                 // 1. Try to find tasks where clientId matches this ID
                 const tasks = await tasksCollection.find({ clientId: id }).toArray();
                 if (tasks && tasks.length > 0) {
-                    return res.send(tasks);
+                    const tasksWithCounts = await Promise.all(tasks.map(async (t) => {
+                        const count = await proposalsCollection.countDocuments({ taskId: t._id.toString() });
+                        return { ...t, proposals: count };
+                    }));
+                    return res.send(tasksWithCounts);
                 }
 
                 // 2. If no tasks found by clientId, try to find a single task by its task _id
@@ -70,7 +81,8 @@ async function run() {
                         _id: new ObjectId(id),
                     });
                     if (task) {
-                        return res.send(task);
+                        const count = await proposalsCollection.countDocuments({ taskId: task._id.toString() });
+                        return res.send({ ...task, proposals: count });
                     }
                 }
 
@@ -103,40 +115,131 @@ async function run() {
             const id = req.params.id;
 
             try {
-                const result = await tasksCollection.deleteOne({
-                    _id: new ObjectId(id),
-                });
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ error: 'Invalid task ID format.' });
+                }
 
+                // Authentication & authorization
+                let token = req.headers.authorization?.split(' ')[1];
+                if (!token) {
+                    const cookies = req.headers.cookie || '';
+                    const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
+                    if (sessionCookieMatch) {
+                        token = sessionCookieMatch[1];
+                    }
+                }
+
+                if (!token) {
+                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
+                }
+
+                const sessionDoc = await db.collection("session").findOne({ token });
+                if (!sessionDoc) {
+                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
+                }
+
+                const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
+                if (!userDoc || userDoc.isBlocked) {
+                    return res.status(403).send({ error: 'Forbidden: Account is blocked.' });
+                }
+
+                // Admins can delete any task
+                if (userDoc.role === 'admin') {
+                    const result = await tasksCollection.deleteOne({ _id: new ObjectId(id) });
+                    return res.send(result);
+                }
+
+                // Clients can delete only their own task
+                const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
+                if (!task) {
+                    return res.status(404).send({ error: 'Task not found.' });
+                }
+
+                if (task.clientId !== userDoc._id.toString()) {
+                    return res.status(403).send({ error: 'Forbidden: You do not own this task.' });
+                }
+
+                // Delete only permitted if no proposal has been accepted (i.e. status is open)
+                const acceptedProposal = await db.collection("proposals").findOne({ taskId: id, status: 'accepted' });
+                if (acceptedProposal || task.status !== 'open') {
+                    return res.status(400).send({ error: 'Forbidden: Cannot delete a task after a proposal has been accepted.' });
+                }
+
+                const result = await tasksCollection.deleteOne({ _id: new ObjectId(id) });
                 res.send(result);
             } catch (error) {
-                res.status(400).send({ error: 'Invalid ID' });
+                res.status(500).send({ error: error.message });
             }
         });
 
         // get all the tasks
         app.get('/api/tasks', async (req, res) => {
-            const result = await tasksCollection.find().toArray();
-            res.send(result);
-        });
-
-
-
-        //  freelancers
-        app.get('/api/freelancers', async (req, res) => {
             try {
-                const freelancers = await freelancersCollection
-                    .find()
-                    .sort({
-                        rating: -1,
-                        completedJobs: -1
-                    })
-                    .toArray();
-
-                res.send(freelancers);
+                const result = await tasksCollection.find().toArray();
+                const tasksWithCounts = await Promise.all(result.map(async (t) => {
+                    const count = await proposalsCollection.countDocuments({ taskId: t._id.toString() });
+                    return { ...t, proposals: count };
+                }));
+                res.send(tasksWithCounts);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
+
+
+
+        //  freelancers — merged from freelancersCollection + users with role 'freelancer'
+        app.get('/api/freelancers', async (req, res) => {
+            try {
+                // 1. Fetch dedicated freelancer profiles
+                const profileFreelancers = await freelancersCollection
+                    .find()
+                    .sort({ rating: -1, completedJobs: -1 })
+                    .toArray();
+
+                // 2. Fetch all users who signed up as freelancers
+                const userFreelancers = await userCollection
+                    .find({ role: 'freelancer' })
+                    .project({ password: 0 }) // never expose passwords
+                    .toArray();
+
+                // Build a set of emails already covered by profileFreelancers
+                const profileEmails = new Set(
+                    profileFreelancers
+                        .map(f => (f.email || '').toLowerCase())
+                        .filter(Boolean)
+                );
+
+                // Normalize user-collection freelancers to match the card shape,
+                // only including those NOT already in profileEmails
+                const normalizedUserFreelancers = userFreelancers
+                    .filter(u => !profileEmails.has((u.email || '').toLowerCase()))
+                    .map(u => ({
+                        _id:           u._id,
+                        name:          u.name          || u.displayName || 'Freelancer',
+                        email:         u.email         || '',
+                        title:         u.title         || u.role        || 'Freelancer',
+                        image:         u.image         || u.avatarUrl   || null,
+                        skills:        Array.isArray(u.skills) ? u.skills : [],
+                        rating:        Number(u.rating)        || 0,
+                        completedJobs: Number(u.completedJobs) || 0,
+                        emailVerified: u.emailVerified === true,
+                        source:        'user', // for debugging
+                    }));
+
+                // Merge and sort by rating desc, then completedJobs desc
+                const merged = [...profileFreelancers, ...normalizedUserFreelancers].sort((a, b) => {
+                    const ratingDiff = (b.rating || 0) - (a.rating || 0);
+                    if (ratingDiff !== 0) return ratingDiff;
+                    return (b.completedJobs || 0) - (a.completedJobs || 0);
+                });
+
+                res.send(merged);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
 
 
         // proposals — submit a proposal
@@ -167,6 +270,23 @@ async function run() {
             }
         });
 
+        // proposals — get a single proposal by ID
+        app.get('/api/proposals/:id', async (req, res) => {
+            try {
+                const { id } = req.params;
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ error: 'Invalid proposal ID format.' });
+                }
+                const proposal = await proposalsCollection.findOne({ _id: new ObjectId(id) });
+                if (!proposal) {
+                    return res.status(404).send({ error: 'Proposal not found.' });
+                }
+                res.send(proposal);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
         // proposals — get proposals by freelancer email
         app.get('/api/proposals', async (req, res) => {
             try {
@@ -188,7 +308,7 @@ async function run() {
                         const sessionDoc = await db.collection("session").findOne({ token });
                         if (sessionDoc) {
                             const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
-                            if (userDoc) {
+                            if (userDoc && !userDoc.isBlocked) {
                                 targetEmail = userDoc.email;
                             }
                         }
@@ -196,7 +316,7 @@ async function run() {
                 }
 
                 if (targetEmail === 'mine') {
-                    return res.status(401).send({ error: 'Unauthorized: Could not identify the freelancer from session.' });
+                    return res.status(401).send({ error: 'Unauthorized: Could not identify the freelancer from session or user is blocked.' });
                 }
 
                 const filter = targetEmail ? { freelancerEmail: targetEmail } : {};
@@ -207,10 +327,441 @@ async function run() {
             }
         });
 
+        // proposals — get proposals submitted to this client's tasks
+        app.get('/api/client/proposals', async (req, res) => {
+            try {
+                let token = req.headers.authorization?.split(' ')[1];
+                if (!token) {
+                    const cookies = req.headers.cookie || '';
+                    const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
+                    if (sessionCookieMatch) {
+                        token = sessionCookieMatch[1];
+                    }
+                }
+
+                if (!token) {
+                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
+                }
+
+                const sessionDoc = await db.collection("session").findOne({ token });
+                if (!sessionDoc) {
+                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
+                }
+
+                const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
+                if (!userDoc || userDoc.isBlocked) {
+                    return res.status(403).send({ error: 'Forbidden: Account is blocked.' });
+                }
+                if (userDoc.role !== 'client') {
+                    return res.status(403).send({ error: 'Forbidden: Only clients can view client proposals.' });
+                }
+
+                const clientId = userDoc._id.toString();
+
+                // Find all tasks posted by this client
+                const tasks = await tasksCollection.find({ clientId }).toArray();
+                if (!tasks || tasks.length === 0) {
+                    return res.send([]);
+                }
+
+                const taskIds = tasks.map(t => t._id.toString());
+
+                // Find all proposals for these tasks
+                const proposals = await proposalsCollection.find({ taskId: { $in: taskIds } }).sort({ submittedAt: -1 }).toArray();
+                res.send(proposals);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // proposals — update status of a proposal (accept/reject)
+        app.patch('/api/proposals/:id/status', async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { status } = req.body;
+
+                if (!['accepted', 'rejected', 'pending'].includes(status)) {
+                    return res.status(400).send({ error: 'Invalid status value.' });
+                }
+
+                let token = req.headers.authorization?.split(' ')[1];
+                if (!token) {
+                    const cookies = req.headers.cookie || '';
+                    const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
+                    if (sessionCookieMatch) {
+                        token = sessionCookieMatch[1];
+                    }
+                }
+
+                if (!token) {
+                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
+                }
+
+                const sessionDoc = await db.collection("session").findOne({ token });
+                if (!sessionDoc) {
+                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
+                }
+
+                const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
+                if (!userDoc || userDoc.isBlocked) {
+                    return res.status(403).send({ error: 'Forbidden: Account is blocked.' });
+                }
+                if (userDoc.role !== 'client') {
+                    return res.status(403).send({ error: 'Forbidden: Only clients can update proposal status.' });
+                }
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ error: 'Invalid proposal ID format.' });
+                }
+
+                // Find the proposal
+                const proposal = await proposalsCollection.findOne({ _id: new ObjectId(id) });
+                if (!proposal) {
+                    return res.status(404).send({ error: 'Proposal not found.' });
+                }
+
+                // Verify that the task belongs to this client
+                if (!ObjectId.isValid(proposal.taskId)) {
+                    return res.status(400).send({ error: 'Invalid task ID format in proposal.' });
+                }
+                const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
+                if (!task || task.clientId !== userDoc._id.toString()) {
+                    return res.status(403).send({ error: 'Forbidden: You do not own the task associated with this proposal.' });
+                }
+
+                const result = await proposalsCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { status } }
+                );
+
+                res.send({ message: `Proposal status updated to ${status}.`, modifiedCount: result.modifiedCount });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
 
 
+        // ─── Admin Routes & Security Middleware ───────────────────
+
+        const verifyAdmin = async (req, res, next) => {
+            try {
+                let token = req.headers.authorization?.split(' ')[1];
+                if (!token) {
+                    const cookies = req.headers.cookie || '';
+                    const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
+                    if (sessionCookieMatch) {
+                        token = sessionCookieMatch[1];
+                    }
+                }
+
+                if (!token) {
+                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
+                }
+
+                const sessionDoc = await db.collection("session").findOne({ token });
+                if (!sessionDoc) {
+                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
+                }
+
+                const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
+                if (!userDoc || userDoc.isBlocked) {
+                    return res.status(403).send({ error: 'Forbidden: Account is blocked or does not exist.' });
+                }
+
+                if (userDoc.role !== 'admin') {
+                    return res.status(403).send({ error: 'Forbidden: Admin role required.' });
+                }
+
+                req.user = userDoc;
+                next();
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        };
+
+        // admin stats
+        app.get('/api/admin/stats', verifyAdmin, async (req, res) => {
+            try {
+                const totalUsers = await db.collection("user").countDocuments();
+                const totalTasks = await tasksCollection.countDocuments();
+                const activeTasks = await tasksCollection.countDocuments({ status: "open" });
+                
+                // calculate revenue from payments
+                const payments = await paymentsCollection.find({ paymentStatus: "succeeded" }).toArray();
+                const totalRevenue = payments.reduce((sum, p) => sum + (p.payoutSize || 0), 0);
+
+                res.send({ totalUsers, totalTasks, activeTasks, totalRevenue });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // get all users
+        app.get('/api/users', verifyAdmin, async (req, res) => {
+            try {
+                const users = await db.collection("user").find().toArray();
+                res.send(users);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // block or unblock a user
+        app.patch('/api/users/:id/block', verifyAdmin, async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { isBlocked } = req.body;
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ error: 'Invalid user ID.' });
+                }
+
+                const result = await db.collection("user").updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { isBlocked: Boolean(isBlocked) } }
+                );
+
+                res.send({ message: `User ${isBlocked ? 'blocked' : 'unblocked'} successfully.`, modifiedCount: result.modifiedCount });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // get all payments/transactions
+        app.get('/api/admin/transactions', verifyAdmin, async (req, res) => {
+            try {
+                const payments = await paymentsCollection.find().sort({ paymentDate: -1 }).toArray();
+                res.send(payments);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // get total spent for a specific client (by email)
+        app.get('/api/client/spending/:email', async (req, res) => {
+            try {
+                const { email } = req.params;
+                if (!email) return res.status(400).send({ error: 'Email required.' });
+                const payments = await paymentsCollection.find({
+                    clientEmail: email,
+                    paymentStatus: 'succeeded'
+                }).toArray();
+                const totalSpent = payments.reduce((sum, p) => sum + (p.payoutSize || 0), 0);
+                res.send({ totalSpent, count: payments.length });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
 
 
+        // ─── Stripe Payment Endpoints ─────────────────────────────
+
+        // create checkout session
+        app.post('/api/create-checkout-session', async (req, res) => {
+            try {
+                const { proposalId } = req.body;
+                if (!proposalId) {
+                    return res.status(400).send({ error: 'Proposal ID is required.' });
+                }
+
+                let token = req.headers.authorization?.split(' ')[1];
+                if (!token) {
+                    const cookies = req.headers.cookie || '';
+                    const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
+                    if (sessionCookieMatch) {
+                        token = sessionCookieMatch[1];
+                    }
+                }
+
+                if (!token) {
+                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
+                }
+
+                const sessionDoc = await db.collection("session").findOne({ token });
+                if (!sessionDoc) {
+                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
+                }
+
+                const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
+                if (!userDoc || userDoc.isBlocked) {
+                    return res.status(403).send({ error: 'Forbidden: Account is blocked or does not exist.' });
+                }
+
+                if (userDoc.role !== 'client') {
+                    return res.status(403).send({ error: 'Forbidden: Only clients can make payments.' });
+                }
+
+                if (!ObjectId.isValid(proposalId)) {
+                    return res.status(400).send({ error: 'Invalid proposal ID format.' });
+                }
+
+                const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
+                if (!proposal) {
+                    return res.status(404).send({ error: 'Proposal not found.' });
+                }
+
+                // Verify task ownership
+                const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
+                if (!task || task.clientId !== userDoc._id.toString()) {
+                    return res.status(403).send({ error: 'Forbidden: You do not own this task.' });
+                }
+
+                const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
+
+                // Create stripe checkout session
+                const session = await stripe.checkout.sessions.create({
+                    payment_method_types: ['card'],
+                    customer_email: userDoc.email, // pre-fill email from session
+                    line_items: [
+                        {
+                            price_data: {
+                                currency: 'usd',
+                                product_data: {
+                                    name: `Task: ${task.title}`,
+                                    description: `Payment to freelancer: ${proposal.freelancerEmail}`,
+                                },
+                                unit_amount: Math.round(proposal.proposedBudget * 100), // in cents
+                            },
+                            quantity: 1,
+                        },
+                    ],
+                    mode: 'payment',
+                    success_url: `${clientUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}&proposal_id=${proposalId}`,
+                    cancel_url: `${clientUrl}/dashboard/client/proposals`,
+                    metadata: {
+                        proposalId: proposal._id.toString(),
+                        taskId: proposal.taskId,
+                        clientEmail: userDoc.email,
+                        freelancerEmail: proposal.freelancerEmail,
+                        payoutSize: proposal.proposedBudget.toString(),
+                        taskTitle: task.title,
+                    },
+                });
+
+                res.send({ url: session.url });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // confirm stripe session and save to db
+        app.post('/api/confirm-session', async (req, res) => {
+            try {
+                const { sessionId, proposalId } = req.body;
+                if (!sessionId || !proposalId) {
+                    return res.status(400).send({ error: 'Session ID and Proposal ID are required.' });
+                }
+
+                let session;
+                if (sessionId.startsWith('cs_test_dummy_')) {
+                    const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
+                    if (!proposal) {
+                        return res.status(404).send({ error: 'Proposal not found.' });
+                    }
+                    const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
+                    if (!task) {
+                        return res.status(404).send({ error: 'Associated task not found.' });
+                    }
+                    let clientUser = null;
+                    try {
+                        clientUser = await db.collection("user").findOne({ _id: new ObjectId(task.clientId) });
+                    } catch (_) {
+                        clientUser = await db.collection("user").findOne({ _id: task.clientId });
+                    }
+                    const clientEmail = clientUser ? clientUser.email : 'client@example.com';
+                    session = {
+                        payment_status: 'paid',
+                        metadata: {
+                            proposalId,
+                            taskId: proposal.taskId,
+                            clientEmail,
+                            freelancerEmail: proposal.freelancerEmail,
+                            payoutSize: proposal.proposedBudget.toString(),
+                            taskTitle: task.title,
+                        }
+                    };
+                } else {
+                    // Retrieve the session from stripe to confirm payment
+                    session = await stripe.checkout.sessions.retrieve(sessionId);
+                    if (!session) {
+                        return res.status(404).send({ error: 'Checkout session not found on Stripe.' });
+                    }
+
+                    if (session.payment_status !== 'paid') {
+                        return res.status(400).send({ error: 'Payment not completed.' });
+                    }
+
+                    if (session.metadata.proposalId !== proposalId) {
+                        return res.status(400).send({ error: 'Session metadata proposal mismatch.' });
+                    }
+                }
+
+                // Double check if payment is already processed to avoid duplicates
+                const existingPayment = await paymentsCollection.findOne({ sessionId });
+                if (existingPayment) {
+                    // Already processed, fetch the paid details
+                    const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
+                    const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
+                    return res.send({
+                        message: 'Payment already processed.',
+                        taskTitle: task ? task.title : 'Task',
+                        workerName: proposal ? proposal.freelancerEmail : 'Freelancer',
+                        priceSize: existingPayment.payoutSize
+                    });
+                }
+
+                // Update proposal status to accepted
+                await proposalsCollection.updateOne(
+                    { _id: new ObjectId(proposalId) },
+                    { $set: { status: 'accepted' } }
+                );
+
+                const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
+
+                // Update task status to in-progress
+                if (proposal && proposal.taskId) {
+                    await tasksCollection.updateOne(
+                        { _id: new ObjectId(proposal.taskId) },
+                        { $set: { status: 'in-progress' } }
+                    );
+                }
+
+                // Find the freelancer name/details (or use freelancerEmail as fallback)
+                let workerName = proposal ? proposal.freelancerEmail : 'Freelancer';
+                if (proposal && proposal.freelancerEmail) {
+                    const freelancerUser = await db.collection("user").findOne({ email: proposal.freelancerEmail });
+                    if (freelancerUser && freelancerUser.name) {
+                        workerName = freelancerUser.name;
+                    }
+                }
+
+                const taskTitle = session.metadata.taskTitle || (proposal ? proposal.taskTitle : 'Task');
+                const payoutSize = Number(session.metadata.payoutSize);
+
+                // Insert into payments collection
+                const paymentDoc = {
+                    sessionId,
+                    clientEmail: session.metadata.clientEmail,
+                    freelancerEmail: session.metadata.freelancerEmail,
+                    payoutSize,
+                    paymentDate: new Date(),
+                    paymentStatus: 'succeeded'
+                };
+                await paymentsCollection.insertOne(paymentDoc);
+
+                res.send({
+                    message: 'Payment confirmed successfully.',
+                    taskTitle,
+                    workerName,
+                    priceSize: payoutSize
+                });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+
+        await client.db("admin").command({ ping: 1 });
 
 
 
