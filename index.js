@@ -6,7 +6,11 @@ const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 app.use(cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:3000',
+    origin: [
+        process.env.CLIENT_URL,
+        'http://localhost:3000',
+        'http://localhost:3001',
+    ].filter(Boolean),
     credentials: true
 }));
 app.use(express.json());
