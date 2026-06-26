@@ -38,6 +38,36 @@ async function run() {
         const proposalsCollection = db.collection("proposals");
         const paymentsCollection = db.collection("payments");
         const userCollection = db.collection("user");
+        const ratingsCollection = db.collection("ratings");
+
+        // ─── Shared session helper ───────────────────────────────────────────
+        async function resolveSessionUser(req) {
+            let token = req.headers.authorization?.split(' ')[1];
+            if (!token) {
+                const cookies = req.headers.cookie || '';
+                const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
+                if (sessionCookieMatch) {
+                    token = sessionCookieMatch[1];
+                }
+            }
+            if (!token) return null;
+
+            const sessionDoc = await db.collection("session").findOne({ token });
+            if (!sessionDoc) return null;
+
+            const userDoc = await userCollection.findOne({ _id: sessionDoc.userId });
+            if (!userDoc || userDoc.isBlocked) return null;
+
+            return userDoc;
+        }
+
+        async function getClientRatingStats(clientId) {
+            if (!clientId) return { average: 0, count: 0 };
+            const ratings = await ratingsCollection.find({ clientId: clientId.toString() }).toArray();
+            if (!ratings.length) return { average: 0, count: 0 };
+            const sum = ratings.reduce((acc, r) => acc + Number(r.stars || 0), 0);
+            return { average: sum / ratings.length, count: ratings.length };
+        }
 
 
 
@@ -224,6 +254,7 @@ async function run() {
                         rating:        Number(u.rating)        || 0,
                         completedJobs: Number(u.completedJobs) || 0,
                         emailVerified: u.emailVerified === true,
+                        isVerified:    u.isVerified === true,
                         source:        'user', // for debugging
                     }));
 
@@ -506,6 +537,30 @@ async function run() {
             }
         });
 
+        // verify or unverify a freelancer
+        app.patch('/api/users/:id/verify', verifyAdmin, async (req, res) => {
+            try {
+                const { id } = req.params;
+                const { isVerified } = req.body;
+
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ error: 'Invalid user ID.' });
+                }
+
+                const result = await userCollection.updateOne(
+                    { _id: new ObjectId(id) },
+                    { $set: { isVerified: Boolean(isVerified) } }
+                );
+
+                res.send({
+                    message: `User ${isVerified ? 'verified' : 'unverified'} successfully.`,
+                    modifiedCount: result.modifiedCount,
+                });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
         // block or unblock a user
         app.patch('/api/users/:id/block', verifyAdmin, async (req, res) => {
             try {
@@ -553,6 +608,125 @@ async function run() {
             }
         });
 
+
+        // ─── Client Ratings (freelancer → client) ─────────────────────────────
+
+        // Submit a rating for a completed proposal
+        app.post('/api/ratings', async (req, res) => {
+            try {
+                const userDoc = await resolveSessionUser(req);
+                if (!userDoc) {
+                    return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
+                }
+                if (userDoc.role !== 'freelancer') {
+                    return res.status(403).send({ error: 'Forbidden: Only freelancers can rate clients.' });
+                }
+
+                const { proposalId, taskId, clientId, stars, review } = req.body;
+                const starNum = Number(stars);
+
+                if (!proposalId || !taskId || !clientId) {
+                    return res.status(400).send({ error: 'proposalId, taskId, and clientId are required.' });
+                }
+                if (!Number.isFinite(starNum) || starNum < 1 || starNum > 5) {
+                    return res.status(400).send({ error: 'stars must be a number between 1 and 5.' });
+                }
+                if (!ObjectId.isValid(proposalId)) {
+                    return res.status(400).send({ error: 'Invalid proposal ID.' });
+                }
+
+                const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
+                if (!proposal) {
+                    return res.status(404).send({ error: 'Proposal not found.' });
+                }
+                if (proposal.freelancerEmail !== userDoc.email) {
+                    return res.status(403).send({ error: 'Forbidden: You can only rate clients for your own proposals.' });
+                }
+                if (proposal.status?.toLowerCase() !== 'accepted') {
+                    return res.status(400).send({ error: 'Only accepted proposals can be rated.' });
+                }
+
+                if (!ObjectId.isValid(taskId)) {
+                    return res.status(400).send({ error: 'Invalid task ID.' });
+                }
+                const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
+                if (!task) {
+                    return res.status(404).send({ error: 'Task not found.' });
+                }
+                if (task.clientId !== clientId.toString()) {
+                    return res.status(400).send({ error: 'clientId does not match the task owner.' });
+                }
+                if (task.status?.toLowerCase() !== 'completed') {
+                    return res.status(400).send({ error: 'Task must be completed before rating the client.' });
+                }
+
+                const existing = await ratingsCollection.findOne({ proposalId: proposalId.toString() });
+                if (existing) {
+                    return res.status(409).send({ error: 'You have already rated this client for this project.' });
+                }
+
+                const ratingDoc = {
+                    proposalId: proposalId.toString(),
+                    taskId: taskId.toString(),
+                    clientId: clientId.toString(),
+                    clientName: task.clientName || null,
+                    clientEmail: task.clientEmail || null,
+                    freelancerEmail: userDoc.email,
+                    freelancerId: userDoc._id.toString(),
+                    stars: starNum,
+                    review: (review || '').trim(),
+                    createdAt: new Date(),
+                };
+
+                const result = await ratingsCollection.insertOne(ratingDoc);
+                const stats = await getClientRatingStats(clientId);
+
+                res.status(201).send({
+                    _id: result.insertedId,
+                    ...ratingDoc,
+                    clientStats: stats,
+                });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // Get ratings — ?mine=true for logged-in freelancer, or /client/:clientId for averages
+        app.get('/api/ratings', async (req, res) => {
+            try {
+                const { mine } = req.query;
+                if (mine === 'true') {
+                    const userDoc = await resolveSessionUser(req);
+                    if (!userDoc) {
+                        return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
+                    }
+                    const ratings = await ratingsCollection
+                        .find({ freelancerEmail: userDoc.email })
+                        .sort({ createdAt: -1 })
+                        .toArray();
+                    return res.send(ratings);
+                }
+
+                const { clientId } = req.query;
+                if (clientId) {
+                    const stats = await getClientRatingStats(clientId);
+                    return res.send(stats);
+                }
+
+                res.status(400).send({ error: 'Use ?mine=true or ?clientId=...' });
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        app.get('/api/ratings/client/:clientId', async (req, res) => {
+            try {
+                const stats = await getClientRatingStats(req.params.clientId);
+                res.send(stats);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
 
         // ─── Stripe Payment Endpoints ─────────────────────────────
 
