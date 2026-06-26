@@ -571,7 +571,7 @@ async function run() {
                         .find({ clientEmail: clientEmail.toLowerCase().trim() })
                         .sort({ createdAt: -1 })
                         .toArray();
-                    return res.send(ratings);
+                    return res.send(ratings)
                 }
 
                 if (freelancerEmail) {
