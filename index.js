@@ -12,7 +12,7 @@ app.use(cors({
         'http://localhost:3001',
     ].filter(Boolean),
     credentials: true
-}));
+}))
 app.use(express.json());
 
 app.get('/', (req, res) => {
