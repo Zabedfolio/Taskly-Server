@@ -608,9 +608,9 @@ run().catch(console.dir);
 
 // For local development
 if (process.env.NODE_ENV !== 'production') {
-    app.listen(port, () => {
-        console.log(`Example app listening on port ${port}`)
-    });
+  app.listen(process.env.PORT || 5000, () => {
+    console.log(`Example app listening on port ${process.env.PORT || 5000}`);
+  });
 }
 
 module.exports = app;
