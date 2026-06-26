@@ -5,7 +5,10 @@ const cors = require('cors')
 require('dotenv').config()
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-app.use(cors())
+app.use(cors({
+  origin: process.env.CLIENT_URL || 'http://localhost:3000',
+  credentials: true
+}))
 app.use(express.json());
 
 app.get('/', (req, res) => {
