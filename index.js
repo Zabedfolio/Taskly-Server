@@ -34,7 +34,6 @@ async function run() {
 
         const db = client.db("taskly-db");
         const tasksCollection = db.collection("tasks");
-        const freelancersCollection = db.collection("freelancers");
         const proposalsCollection = db.collection("proposals");
         const paymentsCollection = db.collection("payments");
         const userCollection = db.collection("user");
@@ -162,70 +161,18 @@ async function run() {
         });
 
 
-        //  getting the tasks by id (supports both clientId list and single task _id)
+        //  getting the tasks by id (simple CRUD GET)
         app.get('/api/tasks/:id', async (req, res) => {
             const id = req.params.id;
-
             try {
-                // 1. Try to find tasks where clientId matches this ID
-                const tasks = await tasksCollection.find({ clientId: id }).toArray();
-                if (tasks && tasks.length > 0) {
-                    const tasksWithCounts = await Promise.all(tasks.map(async (t) => {
-                        const count = await proposalsCollection.countDocuments({ taskId: t._id.toString() });
-                        const proposal = await proposalsCollection.findOne({ taskId: t._id.toString(), status: { $regex: /^accepted$/i } });
-                        let freelancerEmail = null;
-                        let freelancerName = null;
-                        let freelancerImage = null;
-                        if (proposal) {
-                            freelancerEmail = proposal.freelancerEmail;
-                            const freelancerUser = await userCollection.findOne({ email: proposal.freelancerEmail });
-                            if (freelancerUser) {
-                                freelancerName = freelancerUser.name || freelancerUser.displayName || 'Freelancer';
-                                freelancerImage = freelancerUser.image || freelancerUser.avatarUrl || null;
-                            }
-                        }
-                        return { 
-                            ...t, 
-                            proposals: count,
-                            freelancerEmail,
-                            freelancerName,
-                            freelancerImage
-                        };
-                    }));
-                    return res.send(tasksWithCounts);
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ error: 'Invalid task ID.' });
                 }
-
-                // 2. If no tasks found by clientId, try to find a single task by its task _id
-                if (ObjectId.isValid(id)) {
-                    const task = await tasksCollection.findOne({
-                        _id: new ObjectId(id),
-                    });
-                    if (task) {
-                        const count = await proposalsCollection.countDocuments({ taskId: task._id.toString() });
-                        const proposal = await proposalsCollection.findOne({ taskId: task._id.toString(), status: { $regex: /^accepted$/i } });
-                        let freelancerEmail = null;
-                        let freelancerName = null;
-                        let freelancerImage = null;
-                        if (proposal) {
-                            freelancerEmail = proposal.freelancerEmail;
-                            const freelancerUser = await userCollection.findOne({ email: proposal.freelancerEmail });
-                            if (freelancerUser) {
-                                freelancerName = freelancerUser.name || freelancerUser.displayName || 'Freelancer';
-                                freelancerImage = freelancerUser.image || freelancerUser.avatarUrl || null;
-                            }
-                        }
-                        return res.send({ 
-                            ...task, 
-                            proposals: count,
-                            freelancerEmail,
-                            freelancerName,
-                            freelancerImage
-                        });
-                    }
+                const result = await tasksCollection.findOne({ _id: new ObjectId(id) });
+                if (!result) {
+                    return res.status(404).send({ error: 'Task not found.' });
                 }
-
-                // Return empty array if no tasks found
-                res.send([]);
+                res.send(result);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
@@ -328,318 +275,52 @@ async function run() {
             }
         });
 
-        // get all the tasks (supports filters & pagination)
+        // get all the tasks (simple CRUD GET)
         app.get('/api/tasks', async (req, res) => {
             try {
-                const { page, limit, search, category, minBudget, sort } = req.query;
-
-                // Build query object
-                const query = {};
-                if (search) {
-                    query.$or = [
-                        { title: { $regex: search, $options: 'i' } },
-                        { description: { $regex: search, $options: 'i' } }
-                    ];
-                }
-                if (category && category !== 'All Categories') {
-                    query.category = category;
-                }
-                if (minBudget) {
-                    query.budget = { $gte: Number(minBudget) };
-                }
-
-                // Build sort options
-                const sortOptions = {};
-                if (sort === 'newest') {
-                    sortOptions.createdAt = -1;
-                } else if (sort === 'budget-high') {
-                    sortOptions.budget = -1;
-                } else if (sort === 'budget-low') {
-                    sortOptions.budget = 1;
-                } else if (sort === 'deadline') {
-                    sortOptions.deadline = 1;
-                } else {
-                    sortOptions.createdAt = -1;
-                }
-
-                if (page || limit) {
-                    const pageNum = parseInt(page) || 1;
-                    const limitNum = parseInt(limit) || 9;
-                    const skipNum = (pageNum - 1) * limitNum;
-
-                    const total = await tasksCollection.countDocuments(query);
-                    const result = await tasksCollection.find(query)
-                        .sort(sortOptions)
-                        .skip(skipNum)
-                        .limit(limitNum)
-                        .toArray();
-
-                    const tasksWithCounts = await Promise.all(result.map(async (t) => {
-                        const count = await proposalsCollection.countDocuments({ taskId: t._id.toString() });
-                        const proposal = await proposalsCollection.findOne({ taskId: t._id.toString(), status: { $regex: /^accepted$/i } });
-                        let freelancerEmail = null;
-                        let freelancerName = null;
-                        let freelancerImage = null;
-                        if (proposal) {
-                            freelancerEmail = proposal.freelancerEmail;
-                            const freelancerUser = await userCollection.findOne({ email: proposal.freelancerEmail });
-                            if (freelancerUser) {
-                                freelancerName = freelancerUser.name || freelancerUser.displayName || 'Freelancer';
-                                freelancerImage = freelancerUser.image || freelancerUser.avatarUrl || null;
-                            }
-                        }
-                        return { 
-                            ...t, 
-                            proposals: count,
-                            freelancerEmail,
-                            freelancerName,
-                            freelancerImage
-                        };
-                    }));
-
-                    res.send({
-                        tasks: tasksWithCounts,
-                        total,
-                        page: pageNum,
-                        limit: limitNum,
-                        totalPages: Math.ceil(total / limitNum)
-                    });
-                } else {
-                    const result = await tasksCollection.find(query).sort(sortOptions).toArray();
-                    const tasksWithCounts = await Promise.all(result.map(async (t) => {
-                        const count = await proposalsCollection.countDocuments({ taskId: t._id.toString() });
-                        const proposal = await proposalsCollection.findOne({ taskId: t._id.toString(), status: { $regex: /^accepted$/i } });
-                        let freelancerEmail = null;
-                        let freelancerName = null;
-                        let freelancerImage = null;
-                        if (proposal) {
-                            freelancerEmail = proposal.freelancerEmail;
-                            const freelancerUser = await userCollection.findOne({ email: proposal.freelancerEmail });
-                            if (freelancerUser) {
-                                freelancerName = freelancerUser.name || freelancerUser.displayName || 'Freelancer';
-                                freelancerImage = freelancerUser.image || freelancerUser.avatarUrl || null;
-                            }
-                        }
-                        return { 
-                            ...t, 
-                            proposals: count,
-                            freelancerEmail,
-                            freelancerName,
-                            freelancerImage
-                        };
-                    }));
-                    res.send(tasksWithCounts);
-                }
+                const result = await tasksCollection.find({}).sort({ createdAt: -1 }).toArray();
+                res.send(result);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-
-
-        //  freelancers — get data from userCollection based on role 'freelancer'
+        // freelancers — get data from userCollection based on role 'freelancer' (simple CRUD GET)
         app.get('/api/freelancers', async (req, res) => {
             try {
-                const completedJobsByEmail = await getCompletedJobsByEmail();
-
-                // Fetch all users who signed up as freelancers
-                const userFreelancers = await userCollection
+                const freelancers = await userCollection
                     .find({ role: 'freelancer' })
                     .project({ password: 0 })
                     .toArray();
-
-                const withDynamicJobs = (freelancer) => {
-                    const email = (freelancer.email || '').toLowerCase();
-                    const dynamicCount = completedJobsByEmail[email] ?? 0;
-                    return {
-                        ...freelancer,
-                        completedJobs: dynamicCount,
-                    };
-                };
-
-                const freelancers = userFreelancers.map(u => withDynamicJobs({
-                    _id:           u._id,
-                    name:          u.name          || u.displayName || 'Freelancer',
-                    email:         u.email         || '',
-                    title:         u.title         || u.role        || 'Freelancer',
-                    image:         u.image         || u.avatarUrl   || null,
-                    skills:        Array.isArray(u.skills) ? u.skills : (typeof u.skills === 'string' ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : []),
-                    bio:           u.bio           || '',
-                    rating:        Number(u.rating)        || 0,
-                    emailVerified: u.emailVerified === true,
-                    isVerified:    u.isVerified === true,
-                    source:        'user',
-                    completedJobs: 0,
-                }));
-
-                // Keep user documents in sync (fire-and-forget)
-                freelancers.forEach(f => {
-                    if (f.email) syncFreelancerCompletedJobs(f.email, f.completedJobs).catch(() => {});
-                });
-
-                const sorted = freelancers.sort((a, b) => {
-                    const ratingDiff = (b.rating || 0) - (a.rating || 0);
-                    if (ratingDiff !== 0) return ratingDiff;
-                    return (b.completedJobs || 0) - (a.completedJobs || 0);
-                });
-
-                res.send(sorted);
+                res.send(freelancers);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-        // Get single freelancer profile by email
+        // Get single freelancer profile by email (simple CRUD GET)
         app.get('/api/freelancers/:email', async (req, res) => {
             try {
                 const email = req.params.email.toLowerCase().trim();
-                const u = await userCollection.findOne({ email, role: 'freelancer' });
-                if (!u) {
+                const freelancer = await userCollection.findOne({ email, role: 'freelancer' });
+                if (!freelancer) {
                     return res.status(404).send({ error: 'Freelancer not found.' });
                 }
-                const completedJobsByEmail = await getCompletedJobsByEmail();
-                const dynamicCount = completedJobsByEmail[email] ?? 0;
-                const freelancer = {
-                    _id:           u._id,
-                    name:          u.name          || u.displayName || 'Freelancer',
-                    email:         u.email         || '',
-                    title:         u.title         || u.role        || 'Freelancer',
-                    image:         u.image         || u.avatarUrl   || null,
-                    skills:        Array.isArray(u.skills) ? u.skills : (typeof u.skills === 'string' ? u.skills.split(',').map(s => s.trim()).filter(Boolean) : []),
-                    bio:           u.bio           || '',
-                    rating:        Number(u.rating)        || 0,
-                    emailVerified: u.emailVerified === true,
-                    isVerified:    u.isVerified === true,
-                    source:        'user',
-                    completedJobs: dynamicCount,
-                };
                 res.send(freelancer);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-        // Freelancer earnings endpoint
-        app.get('/api/freelancer/earnings', async (req, res) => {
-            try {
-                const userDoc = await resolveSessionUser(req);
-                if (!userDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
-                }
-                if (userDoc.role !== 'freelancer') {
-                    return res.status(403).send({ error: 'Forbidden: Only freelancers can check earnings.' });
-                }
-
-                const email = userDoc.email.toLowerCase().trim();
-                const proposals = await proposalsCollection.find({
-                    freelancerEmail: email,
-                    status: { $regex: /^accepted$/i }
-                }).toArray();
-
-                const earnings = [];
-                let totalEarnings = 0;
-
-                for (const prop of proposals) {
-                    const task = await tasksCollection.findOne({ _id: new ObjectId(prop.taskId) });
-                    if (task && task.status?.toLowerCase() === 'completed') {
-                        // Resolve client details
-                        let clientName = task.clientName || 'Client';
-                        if (!task.clientName && task.clientId) {
-                            try {
-                                const clientUser = await userCollection.findOne({ _id: new ObjectId(task.clientId) });
-                                if (clientUser) {
-                                    clientName = clientUser.name || clientUser.displayName || 'Client';
-                                }
-                            } catch (_) {
-                                const clientUser = await userCollection.findOne({ _id: task.clientId });
-                                if (clientUser) {
-                                    clientName = clientUser.name || clientUser.displayName || 'Client';
-                                }
-                            }
-                        }
-
-                        const amount = prop.proposedBudget || task.budget || 0;
-                        earnings.push({
-                            _id: task._id.toString(),
-                            taskTitle: task.title,
-                            clientName,
-                            amountMade: amount,
-                            completionDate: task.completedAt || task.updatedAt || prop.submittedAt || new Date()
-                        });
-                        totalEarnings += amount;
-                    }
-                }
-
-                // Sort by completion date descending
-                earnings.sort((a, b) => new Date(b.completionDate) - new Date(a.completionDate));
-
-                res.send({
-                    earnings,
-                    stats: {
-                        totalEarnings,
-                        completedCount: earnings.length
-                    }
-                });
-            } catch (error) {
-                res.status(500).send({ error: error.message });
-            }
-        });
-
-        // Logged-in freelancer stats (dynamic completed job count)
-        app.get('/api/freelancers/me/stats', async (req, res) => {
-            try {
-                const userDoc = await resolveSessionUser(req);
-                if (!userDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
-                }
-                if (userDoc.role !== 'freelancer') {
-                    return res.status(403).send({ error: 'Forbidden: Freelancer account required.' });
-                }
-
-                const completedJobsByEmail = await getCompletedJobsByEmail();
-                const email = (userDoc.email || '').toLowerCase();
-                const completedJobs = completedJobsByEmail[email] ?? 0;
-
-                await syncFreelancerCompletedJobs(userDoc.email, completedJobs);
-
-                res.send({
-                    completedJobs,
-                    totalProposals: await proposalsCollection.countDocuments({ freelancerEmail: userDoc.email }),
-                    acceptedProposals: await proposalsCollection.countDocuments({
-                        freelancerEmail: userDoc.email,
-                        status: { $regex: /^accepted$/i },
-                    }),
-                });
-            } catch (error) {
-                res.status(500).send({ error: error.message });
-            }
-        });
 
 
-
-        // proposals — submit a proposal
+        // proposals — submit a proposal (simple CRUD POST)
         app.post('/api/proposals', async (req, res) => {
             try {
-                const { taskId, freelancerEmail, proposedBudget, estimatedDays, coverNote, userId, taskTitle } = req.body;
-
-                if (!taskId || !freelancerEmail || !proposedBudget || !estimatedDays || !coverNote) {
-                    return res.status(400).send({ error: 'All fields are required.' });
-                }
-
-                const proposal = {
-                    taskId,
-                    taskTitle:       taskTitle  || null,
-                    freelancerEmail,
-                    userId:          userId     || null,
-                    proposedBudget:  Number(proposedBudget),
-                    estimatedDays:   Number(estimatedDays),
-                    coverNote,
-                    status:          'pending',
-                    submittedAt:     new Date(),
-                };
-
+                const proposal = req.body;
+                proposal.submittedAt = new Date();
                 const result = await proposalsCollection.insertOne(proposal);
-                res.status(201).send({ insertedId: result.insertedId, message: 'Proposal submitted successfully.' });
+                res.status(201).send(result);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
@@ -662,38 +343,11 @@ async function run() {
             }
         });
 
-        // proposals — get proposals by freelancer email
+        // proposals — get all proposals (with email filter)
         app.get('/api/proposals', async (req, res) => {
             try {
                 const { email, freelancerEmail } = req.query;
-                let targetEmail = freelancerEmail || email;
-
-                if (targetEmail === 'mine') {
-                    // Resolve 'mine' using the Better-Auth session token
-                    let token = req.headers.authorization?.split(' ')[1];
-                    if (!token) {
-                        const cookies = req.headers.cookie || '';
-                        const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
-                        if (sessionCookieMatch) {
-                            token = sessionCookieMatch[1];
-                        }
-                    }
-
-                    if (token) {
-                        const sessionDoc = await db.collection("session").findOne({ token });
-                        if (sessionDoc) {
-                            const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
-                            if (userDoc && !userDoc.isBlocked) {
-                                targetEmail = userDoc.email;
-                            }
-                        }
-                    }
-                }
-
-                if (targetEmail === 'mine') {
-                    return res.status(401).send({ error: 'Unauthorized: Could not identify the freelancer from session or user is blocked.' });
-                }
-
+                const targetEmail = freelancerEmail || email;
                 const filter = targetEmail ? { freelancerEmail: targetEmail } : {};
                 const proposals = await proposalsCollection.find(filter).sort({ submittedAt: -1 }).toArray();
                 res.send(proposals);
@@ -702,54 +356,7 @@ async function run() {
             }
         });
 
-        // proposals — get proposals submitted to this client's tasks
-        app.get('/api/client/proposals', async (req, res) => {
-            try {
-                let token = req.headers.authorization?.split(' ')[1];
-                if (!token) {
-                    const cookies = req.headers.cookie || '';
-                    const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
-                    if (sessionCookieMatch) {
-                        token = sessionCookieMatch[1];
-                    }
-                }
-
-                if (!token) {
-                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
-                }
-
-                const sessionDoc = await db.collection("session").findOne({ token });
-                if (!sessionDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
-                }
-
-                const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
-                if (!userDoc || userDoc.isBlocked) {
-                    return res.status(403).send({ error: 'Forbidden: Account is blocked.' });
-                }
-                if (userDoc.role !== 'client') {
-                    return res.status(403).send({ error: 'Forbidden: Only clients can view client proposals.' });
-                }
-
-                const clientId = userDoc._id.toString();
-
-                // Find all tasks posted by this client
-                const tasks = await tasksCollection.find({ clientId }).toArray();
-                if (!tasks || tasks.length === 0) {
-                    return res.send([]);
-                }
-
-                const taskIds = tasks.map(t => t._id.toString());
-
-                // Find all proposals for these tasks
-                const proposals = await proposalsCollection.find({ taskId: { $in: taskIds } }).sort({ submittedAt: -1 }).toArray();
-                res.send(proposals);
-            } catch (error) {
-                res.status(500).send({ error: error.message });
-            }
-        });
-
-        // proposals — update status of a proposal (accept/reject)
+        // proposals — update status of a proposal (accept/reject) (simple CRUD PATCH)
         app.patch('/api/proposals/:id/status', async (req, res) => {
             try {
                 const { id } = req.params;
@@ -759,49 +366,8 @@ async function run() {
                     return res.status(400).send({ error: 'Invalid status value.' });
                 }
 
-                let token = req.headers.authorization?.split(' ')[1];
-                if (!token) {
-                    const cookies = req.headers.cookie || '';
-                    const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
-                    if (sessionCookieMatch) {
-                        token = sessionCookieMatch[1];
-                    }
-                }
-
-                if (!token) {
-                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
-                }
-
-                const sessionDoc = await db.collection("session").findOne({ token });
-                if (!sessionDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
-                }
-
-                const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
-                if (!userDoc || userDoc.isBlocked) {
-                    return res.status(403).send({ error: 'Forbidden: Account is blocked.' });
-                }
-                if (userDoc.role !== 'client') {
-                    return res.status(403).send({ error: 'Forbidden: Only clients can update proposal status.' });
-                }
-
                 if (!ObjectId.isValid(id)) {
                     return res.status(400).send({ error: 'Invalid proposal ID format.' });
-                }
-
-                // Find the proposal
-                const proposal = await proposalsCollection.findOne({ _id: new ObjectId(id) });
-                if (!proposal) {
-                    return res.status(404).send({ error: 'Proposal not found.' });
-                }
-
-                // Verify that the task belongs to this client
-                if (!ObjectId.isValid(proposal.taskId)) {
-                    return res.status(400).send({ error: 'Invalid task ID format in proposal.' });
-                }
-                const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
-                if (!task || task.clientId !== userDoc._id.toString()) {
-                    return res.status(403).send({ error: 'Forbidden: You do not own the task associated with this proposal.' });
                 }
 
                 const result = await proposalsCollection.updateOne(
@@ -854,24 +420,7 @@ async function run() {
             }
         };
 
-        // admin stats
-        app.get('/api/admin/stats', verifyAdmin, async (req, res) => {
-            try {
-                const totalUsers = await db.collection("user").countDocuments();
-                const totalTasks = await tasksCollection.countDocuments();
-                const activeTasks = await tasksCollection.countDocuments({ status: "open" });
-                
-                // calculate revenue from payments
-                const payments = await paymentsCollection.find({ paymentStatus: "succeeded" }).toArray();
-                const totalRevenue = payments.reduce((sum, p) => sum + (p.payoutSize || 0), 0);
-
-                res.send({ totalUsers, totalTasks, activeTasks, totalRevenue });
-            } catch (error) {
-                res.status(500).send({ error: error.message });
-            }
-        });
-
-        // get all users
+        // get all users (simple CRUD GET)
         app.get('/api/users', verifyAdmin, async (req, res) => {
             try {
                 const users = await db.collection("user").find().toArray();
@@ -881,7 +430,7 @@ async function run() {
             }
         });
 
-        // verify or unverify a freelancer
+        // verify or unverify a freelancer (simple CRUD PATCH)
         app.patch('/api/users/:id/verify', verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
@@ -905,7 +454,7 @@ async function run() {
             }
         });
 
-        // block or unblock a user
+        // block or unblock a user (simple CRUD PATCH)
         app.patch('/api/users/:id/block', verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
@@ -926,7 +475,17 @@ async function run() {
             }
         });
 
-        // get all payments/transactions
+        // get all payments (simple CRUD GET)
+        app.get('/api/payments', async (req, res) => {
+            try {
+                const payments = await paymentsCollection.find().toArray();
+                res.send(payments);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // get all payments/transactions for admin
         app.get('/api/admin/transactions', verifyAdmin, async (req, res) => {
             try {
                 const payments = await paymentsCollection.find().sort({ paymentDate: -1 }).toArray();
@@ -936,100 +495,16 @@ async function run() {
             }
         });
 
-        // get total spent for a specific client (by email)
-        app.get('/api/client/spending/:email', async (req, res) => {
-            try {
-                const { email } = req.params;
-                if (!email) return res.status(400).send({ error: 'Email required.' });
-                const payments = await paymentsCollection.find({
-                    clientEmail: email,
-                    paymentStatus: 'succeeded'
-                }).toArray();
-                const totalSpent = payments.reduce((sum, p) => sum + (p.payoutSize || 0), 0);
-                res.send({ totalSpent, count: payments.length });
-            } catch (error) {
-                res.status(500).send({ error: error.message });
-            }
-        });
-
 
         // ─── Client Ratings (freelancer → client) ─────────────────────────────
 
-        // Submit a rating for a completed proposal
+        // Submit a rating for a completed proposal (simple CRUD POST)
         app.post('/api/ratings', async (req, res) => {
             try {
-                const userDoc = await resolveSessionUser(req);
-                if (!userDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
-                }
-                if (userDoc.role !== 'freelancer') {
-                    return res.status(403).send({ error: 'Forbidden: Only freelancers can rate clients.' });
-                }
-
-                const { proposalId, taskId, clientId, stars, review } = req.body;
-                const starNum = Number(stars);
-
-                if (!proposalId || !taskId || !clientId) {
-                    return res.status(400).send({ error: 'proposalId, taskId, and clientId are required.' });
-                }
-                if (!Number.isFinite(starNum) || starNum < 1 || starNum > 5) {
-                    return res.status(400).send({ error: 'stars must be a number between 1 and 5.' });
-                }
-                if (!ObjectId.isValid(proposalId)) {
-                    return res.status(400).send({ error: 'Invalid proposal ID.' });
-                }
-
-                const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
-                if (!proposal) {
-                    return res.status(404).send({ error: 'Proposal not found.' });
-                }
-                if (proposal.freelancerEmail !== userDoc.email) {
-                    return res.status(403).send({ error: 'Forbidden: You can only rate clients for your own proposals.' });
-                }
-                if (proposal.status?.toLowerCase() !== 'accepted') {
-                    return res.status(400).send({ error: 'Only accepted proposals can be rated.' });
-                }
-
-                if (!ObjectId.isValid(taskId)) {
-                    return res.status(400).send({ error: 'Invalid task ID.' });
-                }
-                const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
-                if (!task) {
-                    return res.status(404).send({ error: 'Task not found.' });
-                }
-                if (task.clientId !== clientId.toString()) {
-                    return res.status(400).send({ error: 'clientId does not match the task owner.' });
-                }
-                if (task.status?.toLowerCase() !== 'completed') {
-                    return res.status(400).send({ error: 'Task must be completed before rating the client.' });
-                }
-
-                const existing = await ratingsCollection.findOne({ proposalId: proposalId.toString() });
-                if (existing) {
-                    return res.status(409).send({ error: 'You have already rated this client for this project.' });
-                }
-
-                const ratingDoc = {
-                    proposalId: proposalId.toString(),
-                    taskId: taskId.toString(),
-                    clientId: clientId.toString(),
-                    clientName: task.clientName || null,
-                    clientEmail: task.clientEmail || null,
-                    freelancerEmail: userDoc.email,
-                    freelancerId: userDoc._id.toString(),
-                    stars: starNum,
-                    review: (review || '').trim(),
-                    createdAt: new Date(),
-                };
-
+                const ratingDoc = req.body;
+                ratingDoc.createdAt = new Date();
                 const result = await ratingsCollection.insertOne(ratingDoc);
-                const stats = await getClientRatingStats(clientId);
-
-                res.status(201).send({
-                    _id: result.insertedId,
-                    ...ratingDoc,
-                    clientStats: stats,
-                });
+                res.status(201).send(result);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
@@ -1074,96 +549,26 @@ async function run() {
 
         // ─── Freelancer Ratings (client → freelancer) ─────────────────────────
 
-        // Submit a rating for a completed project's freelancer
+        // Submit a rating for a completed project's freelancer (simple CRUD POST)
         app.post('/api/freelancer-ratings', async (req, res) => {
             try {
-                const userDoc = await resolveSessionUser(req);
-                if (!userDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
-                }
-                if (userDoc.role !== 'client') {
-                    return res.status(403).send({ error: 'Forbidden: Only clients can rate freelancers.' });
-                }
-
-                const { taskId, freelancerEmail, stars, review } = req.body;
-                const starNum = Number(stars);
-
-                if (!taskId || !freelancerEmail) {
-                    return res.status(400).send({ error: 'taskId and freelancerEmail are required.' });
-                }
-                if (!Number.isFinite(starNum) || starNum < 1 || starNum > 5) {
-                    return res.status(400).send({ error: 'stars must be a number between 1 and 5.' });
-                }
-
-                if (!ObjectId.isValid(taskId)) {
-                    return res.status(400).send({ error: 'Invalid task ID.' });
-                }
-                const task = await tasksCollection.findOne({ _id: new ObjectId(taskId) });
-                if (!task) {
-                    return res.status(404).send({ error: 'Task not found.' });
-                }
-                if (task.clientId !== userDoc._id.toString() && task.clientEmail !== userDoc.email) {
-                    return res.status(403).send({ error: 'Forbidden: You can only rate freelancers for your own tasks.' });
-                }
-                if (task.status?.toLowerCase() !== 'completed') {
-                    return res.status(400).send({ error: 'Task must be completed before rating the freelancer.' });
-                }
-
-                // Verify this freelancer actually worked on the task
-                const proposal = await proposalsCollection.findOne({
-                    taskId: taskId.toString(),
-                    freelancerEmail: freelancerEmail,
-                    status: { $regex: /^accepted$/i }
-                });
-                if (!proposal) {
-                    return res.status(400).send({ error: 'This freelancer was not hired for this task.' });
-                }
-
-                const existing = await freelancerRatingsCollection.findOne({ 
-                    taskId: taskId.toString(), 
-                    freelancerEmail: freelancerEmail.toLowerCase() 
-                });
-                if (existing) {
-                    return res.status(409).send({ error: 'You have already rated this freelancer for this task.' });
-                }
-
-                const ratingDoc = {
-                    taskId: taskId.toString(),
-                    taskTitle: task.title,
-                    clientEmail: userDoc.email,
-                    clientId: userDoc._id.toString(),
-                    clientName: userDoc.name || userDoc.displayName || 'Client',
-                    freelancerEmail: freelancerEmail.toLowerCase(),
-                    stars: starNum,
-                    review: (review || '').trim(),
-                    createdAt: new Date(),
-                };
-
+                const ratingDoc = req.body;
+                ratingDoc.createdAt = new Date();
                 const result = await freelancerRatingsCollection.insertOne(ratingDoc);
-                const stats = await syncFreelancerRating(freelancerEmail);
-
-                res.status(201).send({
-                    _id: result.insertedId,
-                    ...ratingDoc,
-                    freelancerStats: stats,
-                });
+                res.status(201).send(result);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-        // Get freelancer ratings — ?mine=true for client-submitted, ?freelancerEmail=... for average
+        // Get freelancer ratings (simple CRUD GET)
         app.get('/api/freelancer-ratings', async (req, res) => {
             try {
-                const { mine, freelancerEmail } = req.query;
+                const { clientEmail, freelancerEmail } = req.query;
 
-                if (mine === 'true') {
-                    const userDoc = await resolveSessionUser(req);
-                    if (!userDoc) {
-                        return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
-                    }
+                if (clientEmail) {
                     const ratings = await freelancerRatingsCollection
-                        .find({ clientEmail: userDoc.email })
+                        .find({ clientEmail: clientEmail.toLowerCase().trim() })
                         .sort({ createdAt: -1 })
                         .toArray();
                     return res.send(ratings);
