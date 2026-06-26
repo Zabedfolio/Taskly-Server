@@ -69,8 +69,8 @@ async function run() {
             return { average: sum / ratings.length, count: ratings.length };
         }
 
-        /** Count completed gigs per freelancer from proposals + tasks (source of truth). */
-        async function getCompletedJobsCounts() {
+        /** Count completed gigs per freelancer email from proposals + tasks (source of truth). */
+        async function getCompletedJobsByEmail() {
             const completedTasks = await tasksCollection
                 .find({ status: { $regex: /^completed$/i } })
                 .project({ _id: 1 })
@@ -79,27 +79,17 @@ async function run() {
 
             const acceptedProposals = await proposalsCollection
                 .find({ status: { $regex: /^accepted$/i } })
-                .project({ taskId: 1, freelancerEmail: 1, userId: 1 })
+                .project({ taskId: 1, freelancerEmail: 1 })
                 .toArray();
 
-            const byEmail = {};
-            const byUserId = {};
+            const counts = {};
             for (const proposal of acceptedProposals) {
-                const taskId = proposal.taskId?.toString?.() ?? String(proposal.taskId || '');
-                const email = (proposal.freelancerEmail || '').toLowerCase().trim();
-                const userId = proposal.userId?.toString?.() ?? (proposal.userId ? String(proposal.userId) : '');
-                if (!taskId || !completedTaskIds.has(taskId)) continue;
-
-                if (email) byEmail[email] = (byEmail[email] || 0) + 1;
-                if (userId) byUserId[userId] = (byUserId[userId] || 0) + 1;
+                const taskId = proposal.taskId?.toString();
+                const email = (proposal.freelancerEmail || '').toLowerCase();
+                if (!email || !taskId || !completedTaskIds.has(taskId)) continue;
+                counts[email] = (counts[email] || 0) + 1;
             }
-            return { byEmail, byUserId };
-        }
-
-        function resolveCompletedJobs(freelancer, counts) {
-            const email = (freelancer.email || '').toLowerCase().trim();
-            const id = freelancer._id?.toString?.() ?? (freelancer._id ? String(freelancer._id) : '');
-            return counts.byEmail[email] ?? counts.byUserId[id] ?? 0;
+            return counts;
         }
 
         /** Persist computed count onto user + freelancer profile documents. */
@@ -306,7 +296,7 @@ async function run() {
         //  freelancers — merged from freelancersCollection + users with role 'freelancer'
         app.get('/api/freelancers', async (req, res) => {
             try {
-                const completedJobsCounts = await getCompletedJobsCounts();
+                const completedJobsByEmail = await getCompletedJobsByEmail();
 
                 // 1. Fetch dedicated freelancer profiles
                 const profileFreelancers = await freelancersCollection
@@ -326,7 +316,8 @@ async function run() {
                 );
 
                 const withDynamicJobs = (freelancer) => {
-                    const dynamicCount = resolveCompletedJobs(freelancer, completedJobsCounts);
+                    const email = (freelancer.email || '').toLowerCase();
+                    const dynamicCount = completedJobsByEmail[email] ?? 0;
                     return {
                         ...freelancer,
                         completedJobs: dynamicCount,
@@ -378,8 +369,9 @@ async function run() {
                     return res.status(403).send({ error: 'Forbidden: Freelancer account required.' });
                 }
 
-                const completedJobsCounts = await getCompletedJobsCounts();
-                const completedJobs = resolveCompletedJobs(userDoc, completedJobsCounts);
+                const completedJobsByEmail = await getCompletedJobsByEmail();
+                const email = (userDoc.email || '').toLowerCase();
+                const completedJobs = completedJobsByEmail[email] ?? 0;
 
                 await syncFreelancerCompletedJobs(userDoc.email, completedJobs);
 
