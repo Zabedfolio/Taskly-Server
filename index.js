@@ -69,6 +69,65 @@ async function run() {
             return { average: sum / ratings.length, count: ratings.length };
         }
 
+        /** Count completed gigs per freelancer email from proposals + tasks (source of truth). */
+        async function getCompletedJobsByEmail() {
+            const completedTasks = await tasksCollection
+                .find({ status: { $regex: /^completed$/i } })
+                .project({ _id: 1 })
+                .toArray();
+            const completedTaskIds = new Set(completedTasks.map(t => t._id.toString()));
+
+            const acceptedProposals = await proposalsCollection
+                .find({ status: { $regex: /^accepted$/i } })
+                .project({ taskId: 1, freelancerEmail: 1 })
+                .toArray();
+
+            const counts = {};
+            for (const proposal of acceptedProposals) {
+                const taskId = proposal.taskId?.toString();
+                const email = (proposal.freelancerEmail || '').toLowerCase();
+                if (!email || !taskId || !completedTaskIds.has(taskId)) continue;
+                counts[email] = (counts[email] || 0) + 1;
+            }
+            return counts;
+        }
+
+        /** Persist computed count onto user + freelancer profile documents. */
+        async function syncFreelancerCompletedJobs(email, count) {
+            if (!email) return;
+            const normalized = email.toLowerCase();
+            await userCollection.updateOne(
+                { email: { $regex: new RegExp(`^${normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+                { $set: { completedJobs: count } }
+            );
+            await freelancersCollection.updateOne(
+                { email: { $regex: new RegExp(`^${normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } },
+                { $set: { completedJobs: count } }
+            );
+        }
+
+        /** When a task is marked completed, bump the assigned freelancer's cached count. */
+        async function incrementFreelancerCompletedJobs(taskId) {
+            const proposal = await proposalsCollection.findOne({
+                taskId: taskId.toString(),
+                status: { $regex: /^accepted$/i },
+            });
+            if (!proposal?.freelancerEmail) return;
+
+            const emailRegex = new RegExp(
+                `^${proposal.freelancerEmail.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`,
+                'i'
+            );
+            await userCollection.updateOne(
+                { email: emailRegex },
+                { $inc: { completedJobs: 1 } }
+            );
+            await freelancersCollection.updateOne(
+                { email: emailRegex },
+                { $inc: { completedJobs: 1 } }
+            );
+        }
+
 
 
 
@@ -129,10 +188,26 @@ async function run() {
             const updatedTask = req.body;
 
             try {
+                if (!ObjectId.isValid(id)) {
+                    return res.status(400).send({ error: 'Invalid task ID.' });
+                }
+
+                const prevTask = await tasksCollection.findOne({ _id: new ObjectId(id) });
+                if (!prevTask) {
+                    return res.status(404).send({ error: 'Task not found.' });
+                }
+
                 const result = await tasksCollection.updateOne(
                     { _id: new ObjectId(id) },
                     { $set: updatedTask }
                 );
+
+                const prevCompleted = prevTask.status?.toLowerCase() === 'completed';
+                const nowCompleted = updatedTask.status?.toLowerCase() === 'completed';
+
+                if (nowCompleted && !prevCompleted) {
+                    await incrementFreelancerCompletedJobs(id);
+                }
 
                 res.send(result);
             } catch (error) {
@@ -221,30 +296,39 @@ async function run() {
         //  freelancers — merged from freelancersCollection + users with role 'freelancer'
         app.get('/api/freelancers', async (req, res) => {
             try {
+                const completedJobsByEmail = await getCompletedJobsByEmail();
+
                 // 1. Fetch dedicated freelancer profiles
                 const profileFreelancers = await freelancersCollection
                     .find()
-                    .sort({ rating: -1, completedJobs: -1 })
                     .toArray();
 
                 // 2. Fetch all users who signed up as freelancers
                 const userFreelancers = await userCollection
                     .find({ role: 'freelancer' })
-                    .project({ password: 0 }) // never expose passwords
+                    .project({ password: 0 })
                     .toArray();
 
-                // Build a set of emails already covered by profileFreelancers
                 const profileEmails = new Set(
                     profileFreelancers
                         .map(f => (f.email || '').toLowerCase())
                         .filter(Boolean)
                 );
 
-                // Normalize user-collection freelancers to match the card shape,
-                // only including those NOT already in profileEmails
+                const withDynamicJobs = (freelancer) => {
+                    const email = (freelancer.email || '').toLowerCase();
+                    const dynamicCount = completedJobsByEmail[email] ?? 0;
+                    return {
+                        ...freelancer,
+                        completedJobs: dynamicCount,
+                    };
+                };
+
+                const enrichedProfiles = profileFreelancers.map(f => withDynamicJobs(f));
+
                 const normalizedUserFreelancers = userFreelancers
                     .filter(u => !profileEmails.has((u.email || '').toLowerCase()))
-                    .map(u => ({
+                    .map(u => withDynamicJobs({
                         _id:           u._id,
                         name:          u.name          || u.displayName || 'Freelancer',
                         email:         u.email         || '',
@@ -252,20 +336,53 @@ async function run() {
                         image:         u.image         || u.avatarUrl   || null,
                         skills:        Array.isArray(u.skills) ? u.skills : [],
                         rating:        Number(u.rating)        || 0,
-                        completedJobs: Number(u.completedJobs) || 0,
                         emailVerified: u.emailVerified === true,
                         isVerified:    u.isVerified === true,
-                        source:        'user', // for debugging
+                        source:        'user',
                     }));
 
-                // Merge and sort by rating desc, then completedJobs desc
-                const merged = [...profileFreelancers, ...normalizedUserFreelancers].sort((a, b) => {
+                // Keep user documents in sync (fire-and-forget)
+                [...enrichedProfiles, ...normalizedUserFreelancers].forEach(f => {
+                    if (f.email) syncFreelancerCompletedJobs(f.email, f.completedJobs).catch(() => {});
+                });
+
+                const merged = [...enrichedProfiles, ...normalizedUserFreelancers].sort((a, b) => {
                     const ratingDiff = (b.rating || 0) - (a.rating || 0);
                     if (ratingDiff !== 0) return ratingDiff;
                     return (b.completedJobs || 0) - (a.completedJobs || 0);
                 });
 
                 res.send(merged);
+            } catch (error) {
+                res.status(500).send({ error: error.message });
+            }
+        });
+
+        // Logged-in freelancer stats (dynamic completed job count)
+        app.get('/api/freelancers/me/stats', async (req, res) => {
+            try {
+                const userDoc = await resolveSessionUser(req);
+                if (!userDoc) {
+                    return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
+                }
+                if (userDoc.role !== 'freelancer') {
+                    return res.status(403).send({ error: 'Forbidden: Freelancer account required.' });
+                }
+
+                const completedJobsByEmail = await getCompletedJobsByEmail();
+                const email = (userDoc.email || '').toLowerCase();
+                const completedJobs = completedJobsByEmail[email] ?? 0;
+
+                await syncFreelancerCompletedJobs(userDoc.email, completedJobs);
+
+                res.send({
+                    completedJobs,
+                    totalProposals: await proposalsCollection.countDocuments({ freelancerEmail: userDoc.email }),
+                    acceptedProposals: await proposalsCollection.countDocuments({
+                        freelancerEmail: userDoc.email,
+                        status: { $regex: /^accepted$/i },
+                    }),
+                });
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
