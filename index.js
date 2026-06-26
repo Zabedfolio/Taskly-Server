@@ -15,13 +15,9 @@ app.get('/', (req, res) => {
     res.send('Hello World!')
 })
 
-
-
-
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 const uri = process.env.MONGODB_URI;
 
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
 const client = new MongoClient(uri, {
     serverApi: {
         version: ServerApiVersion.v1,
@@ -30,9 +26,10 @@ const client = new MongoClient(uri, {
     }
 });
 
+let dbReady = false;
+
 async function run() {
     try {
-        // Connect the client to the server	(optional starting in v4.7)
         await client.connect();
 
         const db = client.db("taskly-db");
@@ -42,6 +39,8 @@ async function run() {
         const userCollection = db.collection("user");
         const ratingsCollection = db.collection("ratings");
         const freelancerRatingsCollection = db.collection("freelancer_ratings");
+
+        dbReady = true;
 
         // ─── Shared session helper ───────────────────────────────────────────
         async function resolveSessionUser(req) {
@@ -92,7 +91,6 @@ async function run() {
             return stats;
         }
 
-        /** Count completed gigs per freelancer email from proposals + tasks (source of truth). */
         async function getCompletedJobsByEmail() {
             const completedTasks = await tasksCollection
                 .find({ status: { $regex: /^completed$/i } })
@@ -115,7 +113,6 @@ async function run() {
             return counts;
         }
 
-        /** Persist computed count onto user documents. */
         async function syncFreelancerCompletedJobs(email, count) {
             if (!email) return;
             const normalized = email.toLowerCase();
@@ -125,7 +122,6 @@ async function run() {
             );
         }
 
-        /** When a task is marked completed, bump the assigned freelancer's cached count. */
         async function incrementFreelancerCompletedJobs(taskId) {
             const proposal = await proposalsCollection.findOne({
                 taskId: taskId.toString(),
@@ -143,28 +139,16 @@ async function run() {
             );
         }
 
-
-
-
-
-
-
-
         app.post('/api/tasks', async (req, res) => {
             const task = req.body;
-
             const newTask = {
                 ...task,
                 createdAt: new Date(),
             }
-
             const result = await tasksCollection.insertOne(newTask);
-
             res.send(result);
         });
 
-
-        //  getting the tasks by id (simple CRUD GET)
         app.get('/api/tasks/:id', async (req, res) => {
             const id = req.params.id;
             try {
@@ -181,96 +165,60 @@ async function run() {
             }
         });
 
-        // update task by id
         app.put('/api/tasks/:id', async (req, res) => {
             const id = req.params.id;
             const updatedTask = req.body;
-
             try {
                 if (!ObjectId.isValid(id)) {
                     return res.status(400).send({ error: 'Invalid task ID.' });
                 }
-
                 const prevTask = await tasksCollection.findOne({ _id: new ObjectId(id) });
                 if (!prevTask) {
                     return res.status(404).send({ error: 'Task not found.' });
                 }
-
                 const prevCompleted = prevTask.status?.toLowerCase() === 'completed';
                 const nowCompleted = updatedTask.status?.toLowerCase() === 'completed';
-
                 const updateFields = { ...updatedTask };
                 if (nowCompleted && !prevCompleted) {
                     updateFields.completedAt = new Date();
                     await incrementFreelancerCompletedJobs(id);
                 }
-
                 const result = await tasksCollection.updateOne(
                     { _id: new ObjectId(id) },
                     { $set: updateFields }
                 );
-
                 res.send(result);
             } catch (error) {
                 res.status(400).send({ error: 'Invalid ID' });
             }
         });
 
-        // delete task by id
         app.delete('/api/tasks/:id', async (req, res) => {
             const id = req.params.id;
-
             try {
                 if (!ObjectId.isValid(id)) {
                     return res.status(400).send({ error: 'Invalid task ID format.' });
                 }
-
-                // Authentication & authorization
                 let token = req.headers.authorization?.split(' ')[1];
                 if (!token) {
                     const cookies = req.headers.cookie || '';
                     const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
-                    if (sessionCookieMatch) {
-                        token = sessionCookieMatch[1];
-                    }
+                    if (sessionCookieMatch) token = sessionCookieMatch[1];
                 }
-
-                if (!token) {
-                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
-                }
-
+                if (!token) return res.status(401).send({ error: 'Unauthorized: Session token required.' });
                 const sessionDoc = await db.collection("session").findOne({ token });
-                if (!sessionDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
-                }
-
+                if (!sessionDoc) return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
                 const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
-                if (!userDoc || userDoc.isBlocked) {
-                    return res.status(403).send({ error: 'Forbidden: Account is blocked.' });
-                }
-
-                // Admins can delete any task
+                if (!userDoc || userDoc.isBlocked) return res.status(403).send({ error: 'Forbidden: Account is blocked.' });
                 if (userDoc.role === 'admin') {
                     const result = await tasksCollection.deleteOne({ _id: new ObjectId(id) });
                     return res.send(result);
                 }
-
-                // Clients can delete only their own task
                 const task = await tasksCollection.findOne({ _id: new ObjectId(id) });
-                if (!task) {
-                    return res.status(404).send({ error: 'Task not found.' });
-                }
-
-                if (task.clientId !== userDoc._id.toString()) {
-                    return res.status(403).send({ error: 'Forbidden: You do not own this task.' });
-                }
-
-                // Delete only permitted if no proposal has been accepted (i.e. status is open)
+                if (!task) return res.status(404).send({ error: 'Task not found.' });
+                if (task.clientId !== userDoc._id.toString()) return res.status(403).send({ error: 'Forbidden: You do not own this task.' });
                 const acceptedProposal = await db.collection("proposals").findOne({ taskId: id, status: 'accepted' });
-                if (acceptedProposal || task.status !== 'open') {
-                    return res.status(400).send({ error: 'Forbidden: Cannot delete a task after a proposal has been accepted.' });
-                }
-
+                if (acceptedProposal || task.status !== 'open') return res.status(400).send({ error: 'Forbidden: Cannot delete a task after a proposal has been accepted.' });
                 const result = await tasksCollection.deleteOne({ _id: new ObjectId(id) });
                 res.send(result);
             } catch (error) {
@@ -278,7 +226,6 @@ async function run() {
             }
         });
 
-        // get all the tasks (simple CRUD GET)
         app.get('/api/tasks', async (req, res) => {
             try {
                 const result = await tasksCollection.find({}).sort({ createdAt: -1 }).toArray();
@@ -288,7 +235,6 @@ async function run() {
             }
         });
 
-        // freelancers — get data from userCollection based on role 'freelancer' (simple CRUD GET)
         app.get('/api/freelancers', async (req, res) => {
             try {
                 const freelancers = await userCollection
@@ -301,23 +247,17 @@ async function run() {
             }
         });
 
-        // Get single freelancer profile by email (simple CRUD GET)
         app.get('/api/freelancers/:email', async (req, res) => {
             try {
                 const email = req.params.email.toLowerCase().trim();
                 const freelancer = await userCollection.findOne({ email, role: 'freelancer' });
-                if (!freelancer) {
-                    return res.status(404).send({ error: 'Freelancer not found.' });
-                }
+                if (!freelancer) return res.status(404).send({ error: 'Freelancer not found.' });
                 res.send(freelancer);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-
-
-        // proposals — submit a proposal (simple CRUD POST)
         app.post('/api/proposals', async (req, res) => {
             try {
                 const proposal = req.body;
@@ -329,24 +269,18 @@ async function run() {
             }
         });
 
-        // proposals — get a single proposal by ID
         app.get('/api/proposals/:id', async (req, res) => {
             try {
                 const { id } = req.params;
-                if (!ObjectId.isValid(id)) {
-                    return res.status(400).send({ error: 'Invalid proposal ID format.' });
-                }
+                if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid proposal ID format.' });
                 const proposal = await proposalsCollection.findOne({ _id: new ObjectId(id) });
-                if (!proposal) {
-                    return res.status(404).send({ error: 'Proposal not found.' });
-                }
+                if (!proposal) return res.status(404).send({ error: 'Proposal not found.' });
                 res.send(proposal);
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-        // proposals — get all proposals (with email filter)
         app.get('/api/proposals', async (req, res) => {
             try {
                 const { email, freelancerEmail } = req.query;
@@ -359,33 +293,21 @@ async function run() {
             }
         });
 
-        // proposals — update status of a proposal (accept/reject) (simple CRUD PATCH)
         app.patch('/api/proposals/:id/status', async (req, res) => {
             try {
                 const { id } = req.params;
                 const { status } = req.body;
-
-                if (!['accepted', 'rejected', 'pending'].includes(status)) {
-                    return res.status(400).send({ error: 'Invalid status value.' });
-                }
-
-                if (!ObjectId.isValid(id)) {
-                    return res.status(400).send({ error: 'Invalid proposal ID format.' });
-                }
-
+                if (!['accepted', 'rejected', 'pending'].includes(status)) return res.status(400).send({ error: 'Invalid status value.' });
+                if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid proposal ID format.' });
                 const result = await proposalsCollection.updateOne(
                     { _id: new ObjectId(id) },
                     { $set: { status } }
                 );
-
                 res.send({ message: `Proposal status updated to ${status}.`, modifiedCount: result.modifiedCount });
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
-
-
-        // ─── Admin Routes & Security Middleware ───────────────────
 
         const verifyAdmin = async (req, res, next) => {
             try {
@@ -393,29 +315,14 @@ async function run() {
                 if (!token) {
                     const cookies = req.headers.cookie || '';
                     const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
-                    if (sessionCookieMatch) {
-                        token = sessionCookieMatch[1];
-                    }
+                    if (sessionCookieMatch) token = sessionCookieMatch[1];
                 }
-
-                if (!token) {
-                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
-                }
-
+                if (!token) return res.status(401).send({ error: 'Unauthorized: Session token required.' });
                 const sessionDoc = await db.collection("session").findOne({ token });
-                if (!sessionDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
-                }
-
+                if (!sessionDoc) return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
                 const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
-                if (!userDoc || userDoc.isBlocked) {
-                    return res.status(403).send({ error: 'Forbidden: Account is blocked or does not exist.' });
-                }
-
-                if (userDoc.role !== 'admin') {
-                    return res.status(403).send({ error: 'Forbidden: Admin role required.' });
-                }
-
+                if (!userDoc || userDoc.isBlocked) return res.status(403).send({ error: 'Forbidden: Account is blocked or does not exist.' });
+                if (userDoc.role !== 'admin') return res.status(403).send({ error: 'Forbidden: Admin role required.' });
                 req.user = userDoc;
                 next();
             } catch (error) {
@@ -423,7 +330,6 @@ async function run() {
             }
         };
 
-        // get all users (simple CRUD GET)
         app.get('/api/users', verifyAdmin, async (req, res) => {
             try {
                 const users = await db.collection("user").find().toArray();
@@ -433,52 +339,36 @@ async function run() {
             }
         });
 
-        // verify or unverify a freelancer (simple CRUD PATCH)
         app.patch('/api/users/:id/verify', verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
                 const { isVerified } = req.body;
-
-                if (!ObjectId.isValid(id)) {
-                    return res.status(400).send({ error: 'Invalid user ID.' });
-                }
-
+                if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid user ID.' });
                 const result = await userCollection.updateOne(
                     { _id: new ObjectId(id) },
                     { $set: { isVerified: Boolean(isVerified) } }
                 );
-
-                res.send({
-                    message: `User ${isVerified ? 'verified' : 'unverified'} successfully.`,
-                    modifiedCount: result.modifiedCount,
-                });
+                res.send({ message: `User ${isVerified ? 'verified' : 'unverified'} successfully.`, modifiedCount: result.modifiedCount });
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-        // block or unblock a user (simple CRUD PATCH)
         app.patch('/api/users/:id/block', verifyAdmin, async (req, res) => {
             try {
                 const { id } = req.params;
                 const { isBlocked } = req.body;
-
-                if (!ObjectId.isValid(id)) {
-                    return res.status(400).send({ error: 'Invalid user ID.' });
-                }
-
+                if (!ObjectId.isValid(id)) return res.status(400).send({ error: 'Invalid user ID.' });
                 const result = await db.collection("user").updateOne(
                     { _id: new ObjectId(id) },
                     { $set: { isBlocked: Boolean(isBlocked) } }
                 );
-
                 res.send({ message: `User ${isBlocked ? 'blocked' : 'unblocked'} successfully.`, modifiedCount: result.modifiedCount });
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-        // get all payments (simple CRUD GET)
         app.get('/api/payments', async (req, res) => {
             try {
                 const payments = await paymentsCollection.find().toArray();
@@ -488,7 +378,6 @@ async function run() {
             }
         });
 
-        // get all payments/transactions for admin
         app.get('/api/admin/transactions', verifyAdmin, async (req, res) => {
             try {
                 const payments = await paymentsCollection.find().sort({ paymentDate: -1 }).toArray();
@@ -498,10 +387,6 @@ async function run() {
             }
         });
 
-
-        // ─── Client Ratings (freelancer → client) ─────────────────────────────
-
-        // Submit a rating for a completed proposal (simple CRUD POST)
         app.post('/api/ratings', async (req, res) => {
             try {
                 const ratingDoc = req.body;
@@ -513,28 +398,22 @@ async function run() {
             }
         });
 
-        // Get ratings — ?mine=true for logged-in freelancer, or /client/:clientId for averages
         app.get('/api/ratings', async (req, res) => {
             try {
-                const { mine } = req.query;
+                const { mine, clientId } = req.query;
                 if (mine === 'true') {
                     const userDoc = await resolveSessionUser(req);
-                    if (!userDoc) {
-                        return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
-                    }
+                    if (!userDoc) return res.status(401).send({ error: 'Unauthorized: Valid session required.' });
                     const ratings = await ratingsCollection
                         .find({ freelancerEmail: userDoc.email })
                         .sort({ createdAt: -1 })
                         .toArray();
                     return res.send(ratings);
                 }
-
-                const { clientId } = req.query;
                 if (clientId) {
                     const stats = await getClientRatingStats(clientId);
                     return res.send(stats);
                 }
-
                 res.status(400).send({ error: 'Use ?mine=true or ?clientId=...' });
             } catch (error) {
                 res.status(500).send({ error: error.message });
@@ -550,9 +429,6 @@ async function run() {
             }
         });
 
-        // ─── Freelancer Ratings (client → freelancer) ─────────────────────────
-
-        // Submit a rating for a completed project's freelancer (simple CRUD POST)
         app.post('/api/freelancer-ratings', async (req, res) => {
             try {
                 const ratingDoc = req.body;
@@ -564,31 +440,24 @@ async function run() {
             }
         });
 
-        // Get freelancer ratings (simple CRUD GET)
         app.get('/api/freelancer-ratings', async (req, res) => {
             try {
                 const { clientEmail, freelancerEmail } = req.query;
-
                 if (clientEmail) {
                     const ratings = await freelancerRatingsCollection
                         .find({ clientEmail: clientEmail.toLowerCase().trim() })
                         .sort({ createdAt: -1 })
                         .toArray();
-                    return res.send(ratings)
+                    return res.send(ratings);
                 }
-
                 if (freelancerEmail) {
                     const stats = await getFreelancerRatingStats(freelancerEmail);
                     const reviews = await freelancerRatingsCollection
                         .find({ freelancerEmail: freelancerEmail.toLowerCase().trim() })
                         .sort({ createdAt: -1 })
                         .toArray();
-                    return res.send({
-                        ...stats,
-                        reviews
-                    });
+                    return res.send({ ...stats, reviews });
                 }
-
                 const all = await freelancerRatingsCollection.find().toArray();
                 res.send(all);
             } catch (error) {
@@ -596,77 +465,42 @@ async function run() {
             }
         });
 
-        // ─── Stripe Payment Endpoints ─────────────────────────────
-
-        // create checkout session
         app.post('/api/create-checkout-session', async (req, res) => {
             try {
                 const { proposalId } = req.body;
-                if (!proposalId) {
-                    return res.status(400).send({ error: 'Proposal ID is required.' });
-                }
-
+                if (!proposalId) return res.status(400).send({ error: 'Proposal ID is required.' });
                 let token = req.headers.authorization?.split(' ')[1];
                 if (!token) {
                     const cookies = req.headers.cookie || '';
                     const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
-                    if (sessionCookieMatch) {
-                        token = sessionCookieMatch[1];
-                    }
+                    if (sessionCookieMatch) token = sessionCookieMatch[1];
                 }
-
-                if (!token) {
-                    return res.status(401).send({ error: 'Unauthorized: Session token required.' });
-                }
-
+                if (!token) return res.status(401).send({ error: 'Unauthorized: Session token required.' });
                 const sessionDoc = await db.collection("session").findOne({ token });
-                if (!sessionDoc) {
-                    return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
-                }
-
+                if (!sessionDoc) return res.status(401).send({ error: 'Unauthorized: Invalid session.' });
                 const userDoc = await db.collection("user").findOne({ _id: sessionDoc.userId });
-                if (!userDoc || userDoc.isBlocked) {
-                    return res.status(403).send({ error: 'Forbidden: Account is blocked or does not exist.' });
-                }
-
-                if (userDoc.role !== 'client') {
-                    return res.status(403).send({ error: 'Forbidden: Only clients can make payments.' });
-                }
-
-                if (!ObjectId.isValid(proposalId)) {
-                    return res.status(400).send({ error: 'Invalid proposal ID format.' });
-                }
-
+                if (!userDoc || userDoc.isBlocked) return res.status(403).send({ error: 'Forbidden: Account is blocked or does not exist.' });
+                if (userDoc.role !== 'client') return res.status(403).send({ error: 'Forbidden: Only clients can make payments.' });
+                if (!ObjectId.isValid(proposalId)) return res.status(400).send({ error: 'Invalid proposal ID format.' });
                 const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
-                if (!proposal) {
-                    return res.status(404).send({ error: 'Proposal not found.' });
-                }
-
-                // Verify task ownership
+                if (!proposal) return res.status(404).send({ error: 'Proposal not found.' });
                 const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
-                if (!task || task.clientId !== userDoc._id.toString()) {
-                    return res.status(403).send({ error: 'Forbidden: You do not own this task.' });
-                }
-
+                if (!task || task.clientId !== userDoc._id.toString()) return res.status(403).send({ error: 'Forbidden: You do not own this task.' });
                 const clientUrl = process.env.CLIENT_URL || 'http://localhost:3000';
-
-                // Create stripe checkout session
                 const session = await stripe.checkout.sessions.create({
                     payment_method_types: ['card'],
-                    customer_email: userDoc.email, // pre-fill email from session
-                    line_items: [
-                        {
-                            price_data: {
-                                currency: 'usd',
-                                product_data: {
-                                    name: `Task: ${task.title}`,
-                                    description: `Payment to freelancer: ${proposal.freelancerEmail}`,
-                                },
-                                unit_amount: Math.round(proposal.proposedBudget * 100), // in cents
+                    customer_email: userDoc.email,
+                    line_items: [{
+                        price_data: {
+                            currency: 'usd',
+                            product_data: {
+                                name: `Task: ${task.title}`,
+                                description: `Payment to freelancer: ${proposal.freelancerEmail}`,
                             },
-                            quantity: 1,
+                            unit_amount: Math.round(proposal.proposedBudget * 100),
                         },
-                    ],
+                        quantity: 1,
+                    }],
                     mode: 'payment',
                     success_url: `${clientUrl}/payment-success?session_id={CHECKOUT_SESSION_ID}&proposal_id=${proposalId}`,
                     cancel_url: `${clientUrl}/dashboard/client/proposals`,
@@ -679,31 +513,22 @@ async function run() {
                         taskTitle: task.title,
                     },
                 });
-
                 res.send({ url: session.url });
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-        // confirm stripe session and save to db
         app.post('/api/confirm-session', async (req, res) => {
             try {
                 const { sessionId, proposalId } = req.body;
-                if (!sessionId || !proposalId) {
-                    return res.status(400).send({ error: 'Session ID and Proposal ID are required.' });
-                }
-
+                if (!sessionId || !proposalId) return res.status(400).send({ error: 'Session ID and Proposal ID are required.' });
                 let session;
                 if (sessionId.startsWith('cs_test_dummy_')) {
                     const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
-                    if (!proposal) {
-                        return res.status(404).send({ error: 'Proposal not found.' });
-                    }
+                    if (!proposal) return res.status(404).send({ error: 'Proposal not found.' });
                     const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
-                    if (!task) {
-                        return res.status(404).send({ error: 'Associated task not found.' });
-                    }
+                    if (!task) return res.status(404).send({ error: 'Associated task not found.' });
                     let clientUser = null;
                     try {
                         clientUser = await db.collection("user").findOne({ _id: new ObjectId(task.clientId) });
@@ -723,25 +548,13 @@ async function run() {
                         }
                     };
                 } else {
-                    // Retrieve the session from stripe to confirm payment
                     session = await stripe.checkout.sessions.retrieve(sessionId);
-                    if (!session) {
-                        return res.status(404).send({ error: 'Checkout session not found on Stripe.' });
-                    }
-
-                    if (session.payment_status !== 'paid') {
-                        return res.status(400).send({ error: 'Payment not completed.' });
-                    }
-
-                    if (session.metadata.proposalId !== proposalId) {
-                        return res.status(400).send({ error: 'Session metadata proposal mismatch.' });
-                    }
+                    if (!session) return res.status(404).send({ error: 'Checkout session not found on Stripe.' });
+                    if (session.payment_status !== 'paid') return res.status(400).send({ error: 'Payment not completed.' });
+                    if (session.metadata.proposalId !== proposalId) return res.status(400).send({ error: 'Session metadata proposal mismatch.' });
                 }
-
-                // Double check if payment is already processed to avoid duplicates
                 const existingPayment = await paymentsCollection.findOne({ sessionId });
                 if (existingPayment) {
-                    // Already processed, fetch the paid details
                     const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
                     const task = await tasksCollection.findOne({ _id: new ObjectId(proposal.taskId) });
                     return res.send({
@@ -751,36 +564,24 @@ async function run() {
                         priceSize: existingPayment.payoutSize
                     });
                 }
-
-                // Update proposal status to accepted
                 await proposalsCollection.updateOne(
                     { _id: new ObjectId(proposalId) },
                     { $set: { status: 'accepted' } }
                 );
-
                 const proposal = await proposalsCollection.findOne({ _id: new ObjectId(proposalId) });
-
-                // Update task status to in-progress
                 if (proposal && proposal.taskId) {
                     await tasksCollection.updateOne(
                         { _id: new ObjectId(proposal.taskId) },
                         { $set: { status: 'in-progress' } }
                     );
                 }
-
-                // Find the freelancer name/details (or use freelancerEmail as fallback)
                 let workerName = proposal ? proposal.freelancerEmail : 'Freelancer';
                 if (proposal && proposal.freelancerEmail) {
                     const freelancerUser = await db.collection("user").findOne({ email: proposal.freelancerEmail });
-                    if (freelancerUser && freelancerUser.name) {
-                        workerName = freelancerUser.name;
-                    }
+                    if (freelancerUser && freelancerUser.name) workerName = freelancerUser.name;
                 }
-
                 const taskTitle = session.metadata.taskTitle || (proposal ? proposal.taskTitle : 'Task');
                 const payoutSize = Number(session.metadata.payoutSize);
-
-                // Insert into payments collection
                 const paymentDoc = {
                     sessionId,
                     clientEmail: session.metadata.clientEmail,
@@ -790,37 +591,26 @@ async function run() {
                     paymentStatus: 'succeeded'
                 };
                 await paymentsCollection.insertOne(paymentDoc);
-
-                res.send({
-                    message: 'Payment confirmed successfully.',
-                    taskTitle,
-                    workerName,
-                    priceSize: payoutSize
-                });
+                res.send({ message: 'Payment confirmed successfully.', taskTitle, workerName, priceSize: payoutSize });
             } catch (error) {
                 res.status(500).send({ error: error.message });
             }
         });
 
-
-        await client.db("admin").command({ ping: 1 });
-
-
-
-
-
-
         await client.db("admin").command({ ping: 1 });
         console.log("Pinged your deployment. You successfully connected to MongoDB!");
-    } finally {
-        // Ensures that the client will close when you finish/error
-        // await client.close();
+    } catch (err) {
+        console.error("Failed to connect to MongoDB:", err);
     }
 }
+
 run().catch(console.dir);
 
+// For local development
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(port, () => {
+        console.log(`Example app listening on port ${port}`)
+    });
+}
 
-
-app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`)
-})
+module.exports = app;
