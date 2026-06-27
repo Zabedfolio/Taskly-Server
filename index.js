@@ -59,7 +59,7 @@ connectDB();
 async function resolveSessionUser(req) {
     let token = req.headers.authorization?.split(' ')[1];
     if (!token) {
-        const cookies = req.headers.cookie || '';
+        const cookies = req.headers.cookie || ''
         const sessionCookieMatch = cookies.match(/better-auth\.session_token=([^;]+)/);
         if (sessionCookieMatch) {
             token = sessionCookieMatch[1];
